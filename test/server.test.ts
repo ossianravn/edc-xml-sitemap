@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { once } from 'node:events';
+import { PageCache } from '../src/cache.ts';
+import { CacheStore } from '../src/cache-store.ts';
+import { createSitemapServer } from '../src/server.ts';
+
+test('real HTTP service returns XML/downloads, reuses cached input and reports empty/error states', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'edc-http-'));
+  const log = () => {};
+  const store = new CacheStore(directory, log);
+  await store.initialize();
+  let now = Date.parse('2026-09-09T12:00:00Z'), calls = 0, fail = false;
+  const cache = new PageCache(store, { freshMs: 1000, maxAgeMs: 5000, retryMs: 500 }, async input => {
+    calls++;
+    if (fail) throw new Error('Fixture outage');
+    return input.inputPageNumber === 2 ? [] : [{ caseNumber: '123',
+      urlPath: '/alle-boliger/villa/zip/a&b/123/', statusChangeDate: '2026-09-08T12:00:00Z' }];
+  }, log, () => now);
+  const server = createSitemapServer(cache, log, () => now);
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const base = `http://127.0.0.1:${address.port}`;
+  const invalid = await fetch(`${base}/sitemap.xml?inputPageSize=0`);
+  assert.equal(invalid.status, 400);
+  assert.equal(calls, 0);
+  const first = await fetch(`${base}/sitemap.xml`);
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get('x-cache-status'), 'REFRESH');
+  assert.match(first.headers.get('content-type')!, /application\/xml/);
+  assert.match(await first.text(), /a&amp;b\/123\/<\/loc>/);
+  const download = await fetch(`${base}/sitemap.xml?caseType=bbr&dl=1&maxDaysAge=7`);
+  assert.equal(download.headers.get('x-cache-status'), 'HIT');
+  assert.match(download.headers.get('content-disposition')!, /attachment; filename="edc-bbr-sitemap.xml"/);
+  assert.match(await download.text(), /a&amp;b\/<\/loc>/);
+  assert.equal(calls, 1);
+  const head = await fetch(`${base}/sitemap.xml`, { method: 'HEAD' });
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), '');
+  const empty = await fetch(`${base}/sitemap.xml?inputPageNumber=2`);
+  assert.equal(empty.status, 200);
+  assert.equal(empty.headers.get('x-sitemap-url-count'), '0');
+  fail = true;
+  now += 1000;
+  const stale = await fetch(`${base}/sitemap.xml`);
+  assert.equal(stale.status, 200);
+  assert.equal(stale.headers.get('x-cache-status'), 'STALE');
+  now += 4000;
+  assert.equal((await fetch(`${base}/sitemap.xml`)).status, 503);
+  assert.equal((await fetch(`${base}/healthz`)).status, 200, 'health is local liveness');
+});
